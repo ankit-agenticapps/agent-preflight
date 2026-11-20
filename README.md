@@ -4,7 +4,9 @@ Check a cloned repo **before** you let an AI coding agent (Claude Code, Codex, C
 
 Researchers recently reported repos that hide instructions in CLAUDE.md and agent hooks to hijack coding agents: steal secrets, phone home, run code on session start, or quietly override you. `agent-preflight` reads the agent instruction and config files in a repo and flags those tricks. It is read-only and never executes, imports, or sources anything from the repo it scans. Standard library only, Python 3.9+.
 
-<!-- demo GIF goes here -->
+![agent-preflight demo](docs/demo.gif)
+
+_The repo in the first half of the demo is a fake one built to show the hidden-text trick._
 
 ## Install
 
