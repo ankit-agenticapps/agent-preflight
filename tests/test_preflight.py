@@ -326,7 +326,7 @@ class Tuning(Base):
         _, out = run_cli(["--all-repos", parent, "--no-color"])
         self.assertIn("hooks", out)
         self.assertRegex(out, r"\na\s+1\s+1\s+0\s+0\s+1\n")
-        self.assertIn("2 of 3 repos ship agent hooks that run commands (1 at session start; 0 of those only in Claude Code on the web). 0 send data to a third-party host.", out)
+        self.assertIn("2 of 3 repos ship agent hooks that run commands (1 at session start; 0 of those only in Claude Code on the web). 0 send usage data to an outside server from a hook.", out)
 
     def test_demo_trapped_repo(self):
         root = self.repo({
@@ -419,7 +419,7 @@ class V012(Base):
                 open(p, "w").write(text)
         _, out = run_cli(["--all-repos", parent, "--no-color"])
         self.assertIn("2 of 2 repos ship agent hooks that run commands (1 at session start; 1 of those only in Claude Code on the web). "
-                      "1 sends data to a third-party host.", out)
+                      "1 sends usage data to an outside server from a hook.", out)
 
 
 if __name__ == "__main__":

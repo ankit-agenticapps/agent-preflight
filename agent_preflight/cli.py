@@ -127,7 +127,7 @@ def table(rows, color):
     egress = sum(1 for r in rows if r["hooks_egress"])
     lines.append("")
     lines.append("%d of %d repo%s %s agent hooks that run commands (%d at session start; %d of those only in Claude Code on the web). "
-                 "%d %s data to a third-party host."
+                 "%d %s usage data to an outside server from a hook."
                  % (with_hooks, n, "" if n == 1 else "s", "ships" if with_hooks == 1 else "ship", at_start, web_only,
                     egress, "sends" if egress == 1 else "send"))
     return "\n".join(lines)
