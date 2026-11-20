@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import textwrap
 
 from . import __version__
 from .scanner import SEV_ORDER, START_EVENTS, scan_repo
@@ -31,22 +32,80 @@ def verdict(c, n):
     return "✓ no issues found in %d agent file%s%s" % (n, "" if n == 1 else "s", extra), "ok"
 
 
+WRAP = 96
+HIDDEN_TITLE = "Hidden instruction in invisible characters"
+
+
+def group_findings(findings):
+    """One entry per file:line: highest severity, combined title, all rule ids."""
+    order, groups = [], {}
+    for f in findings:
+        k = (f["file"], f["line"])
+        if k not in groups:
+            groups[k] = []
+            order.append(k)
+        groups[k].append(f)
+    out = []
+    for k in order:
+        fs = groups[k]
+        top = max(fs, key=lambda f: SEV_ORDER[f["severity"]])
+        rules = []
+        for f in fs:
+            if f["rule"] not in rules:
+                rules.append(f["rule"])
+        pf5 = [f for f in fs if f["rule"] == "PF005"]
+        details = []
+        for f in fs:
+            if f.get("detail") and f["detail"] not in details:
+                details.append(f["detail"])
+        if pf5 and pf5[0]["snippet"].startswith("decoded:"):
+            title, snippet, why = HIDDEN_TITLE, pf5[0]["snippet"], pf5[0]["why"]
+        else:
+            if any(f["rule"] == "PF001" for f in fs):
+                tf = [f for f in fs if f["rule"] not in ("PF002", "PF003", "PF004")]
+            else:
+                tf = fs
+            titles = []
+            for f in tf:
+                if f["title"] not in titles:
+                    titles.append(f["title"])
+            title = ", ".join(titles[:1] + [t[0].lower() + t[1:] for t in titles[1:]])
+            shown = [f for f in fs if not f["snippet"].startswith("hidden:")] or fs
+            snippet = shown[0]["snippet"]
+            why = top["why"]
+        out.append({"severity": top["severity"], "rules": rules, "file": k[0], "line": k[1],
+                    "title": title, "snippet": snippet, "details": details, "why": why})
+    out.sort(key=lambda g: -SEV_ORDER[g["severity"]])
+    return out
+
+
+def wrap(text, indent="      "):
+    return textwrap.wrap(text, WRAP, initial_indent=indent, subsequent_indent=indent,
+                         replace_whitespace=False, drop_whitespace=True) or [indent]
+
+
 def render(path, n, findings, color):
     def paint(s, code):
         return code + s + RESET if color else s
     out = []
-    out.append(paint("agent-preflight", BOLD) + "  " + path + "  " + paint("· %d agent file%s found" % (n, "" if n == 1 else "s"), DIM))
+    out.append(paint("agent-preflight", BOLD) + "  " + os.path.basename(os.path.abspath(path)) + "  " + paint("· %d agent file%s found" % (n, "" if n == 1 else "s"), DIM))
     out.append("")
-    for f in findings:
-        code = COLORS[f["severity"]]
-        loc = "%s:%d" % (f["file"], f["line"])
-        out.append("%s  %s  %s  %s" % (paint(LABEL[f["severity"]], code), paint(f["rule"], BOLD), loc, f["title"]))
-        out.append("      " + paint(f["snippet"], DIM if f["severity"] == "low" else ""))
-        if f.get("detail"):
-            out.append("      " + paint(f["detail"], DIM))
-        out.append("      " + paint("why: " + f["why"], DIM))
+    groups = group_findings(findings)
+    for g in groups:
+        code = COLORS[g["severity"]]
+        loc = "%s:%d" % (g["file"], g["line"])
+        label, rules = LABEL[g["severity"]], " ".join(g["rules"])
+        head = textwrap.wrap("%s  %s  %s  %s" % (label, rules, loc, g["title"]), WRAP,
+                             subsequent_indent="      ", break_long_words=False)
+        head[0] = head[0].replace(label, paint(label, code), 1).replace(rules, paint(rules, BOLD), 1)
+        out.extend(head)
+        dim = DIM if g["severity"] == "low" else ""
+        out.extend(paint(l, dim) if dim else l for l in wrap(g["snippet"]))
+        for d in g["details"]:
+            out.extend(paint(l, DIM) for l in wrap(d))
+        out.extend(paint(l, DIM) for l in wrap("why: " + g["why"]))
         out.append("")
-    text, level = verdict(counts(findings), n)
+    text, level = verdict(counts(groups), n)
     vcode = {"high": COLORS["high"], "medium": COLORS["medium"], "ok": "\033[1;32m"}[level]
     out.append(paint(text, vcode))
     return "\n".join(out)

@@ -670,7 +670,7 @@ def claude_settings(data, file, lines, root=None):
                         if hosts:
                             tele = any("telemetry" in f["detail"] for f in meta["egress"])
                             d += " \u2014 script sends data to %s%s" % (", ".join(hosts), " (looks like analytics/telemetry)" if tele else "")
-                        elif not hit:
+                        elif not hit and not meta["download"]:
                             d += " \u2014 no network or secret access found in the script"
                         if meta["download"]:
                             d += " \u2014 " + meta["download"]
