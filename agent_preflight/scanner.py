@@ -29,9 +29,17 @@ RULES = {
     "PF203": ("low", "unparseable-config", "The config could not be parsed as JSON, so it was only text-scanned and may hide things."),
 }
 
-AUTO_EVENTS = {"SessionStart", "UserPromptSubmit", "PreToolUse"}
+START_EVENTS = {"SessionStart", "UserPromptSubmit", "Setup"}
+MAX_SCRIPT_BYTES = 1024 * 1024
 ALLOW_DOMAINS = ["github.com", "python.org", "npmjs.com", "pypi.org", "anthropic.com",
-                 "openai.com", "microsoft.com", "google.com", "mozilla.org", "readthedocs.io"]
+                 "openai.com", "microsoft.com", "google.com", "mozilla.org", "readthedocs.io",
+                 "files.pythonhosted.org", "dot.net", "nodejs.org", "rustup.rs", "sh.rustup.rs",
+                 "deno.land", "bun.sh", "astral.sh", "get.docker.com", "brew.sh",
+                 "raw.githubusercontent.com", "registry.npmjs.org"]
+# Official installer hosts: a piped install from these is MEDIUM in instruction prose, not HIGH.
+# (raw.githubusercontent.com is deliberately absent: it hosts anyone's scripts.)
+OFFICIAL_INSTALLERS = ["dot.net", "rustup.rs", "sh.rustup.rs", "astral.sh", "bun.sh", "deno.land",
+                       "get.docker.com", "brew.sh", "nodejs.org"]
 
 # ---------------------------------------------------------------- patterns
 I = re.I
@@ -57,10 +65,22 @@ SECRET_PATHS = re.compile(
 SECRET_NAMES = re.compile(
     r"\b(ANTHROPIC_API_KEY|OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN|AWS_SECRET_ACCESS_KEY|AWS_ACCESS_KEY_ID|AWS_SESSION_TOKEN"
     r"|NPM_TOKEN|GEMINI_API_KEY|GOOGLE_API_KEY|HF_TOKEN|[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_(?:API_KEY|SECRET|SECRET_KEY|TOKEN|PASSWORD))\b")
-SECRET_VERB = re.compile(r"\b(read|send|print|cat|echo|show|output|dump|post|upload|reveal|paste|leak|exfiltrate|display|curl|wget|base64)\b", I)
-SECRET_NEGATION = re.compile(
-    r"\b(never|do\s+not|don'?t|must\s+not|should\s+not|avoid)\s+(\w+\s+){0,2}"
-    r"(read|commit|touch|access|print|share|expose|include|log|echo|show|send|upload|store|put|hardcode|check\s+in|paste)\b", I)
+SECRET_ACTION = re.compile(r"\b(read|cat|send|print|echo|upload|post|copy|exfiltrate|paste|include)\b", I)
+NEG_SECRET = re.compile(r"\b(never|don'?t|do\s+not|avoid|must\s+not|shouldn'?t|should\s+not|not)\b", I)
+NEG_NET = re.compile(r"\b(never|don'?t|do\s+not|avoid|instead\s+of|rather\s+than)\b", I)
+DESCRIPTIVE_MODAL = re.compile(r"\b(can|could|may|might|will|would|does|cannot|can'?t)\s+(also\s+)?$", I)
+TEMPLATE_ENV = re.compile(r"\.env\.(example|sample|template|dist)\b", I)
+EXISTS_CHECK = re.compile(r"\b(test\s+-[a-z]|\[\[?\s+-[a-z])\s+$", I)
+# env-file loading / existence checks / VAR= assignments are not secret reads in commands
+ENV_LOAD = re.compile(
+    r"--env-file(-if-exists)?(=|\s+)\S+"
+    r"|\bdotenvx?\b(\s+run)?(\s+(-f|-e|--env-file|--env)\s+\S+|\s+--[\w-]+(=\S+)?)*"
+    r"|(?:\btest|\[\[?)\s+-[a-z]\s+\S+"
+    r"|\b(echo|printf)\s+(\"[^\"$]*\"|'[^']*')"
+    r"|\b[A-Za-z_][A-Za-z0-9_]*=(?=\S)", I)
+DATA_FLAGS = re.compile(
+    r"(?<![\w-])-d\b|(?<![\w-])-F\b|(?<![\w-])-T\b|(?i:--data\S*|--post-\S+|--form\S*|--upload-file|--body-\S+"
+    r"|-X\s*(POST|PUT|PATCH)\b|-Body\b|-InFile\b)")
 
 OVERRIDE = [
     re.compile(r"ignore\s+(all\s+|any\s+)?(previous|prior|above|earlier|preceding)\s+(\w+\s+)?(instructions?|rules|prompts?|directions)", I),
@@ -141,12 +161,29 @@ def url_hosts(s):
     return hosts
 
 
+def sends_data(text):
+    """True if a curl/wget-style command carries data out (flags, or substitution inside a URL)."""
+    m = NET_TOOL.search(text)
+    seg = text[m.start():] if m else text
+    seg = re.split(r"(?<!\|)\|(?!\|)|;|&&", seg, maxsplit=1)[0]  # only this command, not what it is piped into
+    if DATA_FLAGS.search(seg):
+        return True
+    return any("$(" in u.group(0) or "`" in u.group(0) for u in URL_RE.finditer(seg))
+
+
+def sentence_prefix(full, pos):
+    start = 0
+    for b in re.finditer(r"[.!?](?=\s)", full[:pos]):
+        start = b.end()
+    return full[start:pos]
+
+
 def net_hit(text):
     """Return match for a network-exfil style construct, or None."""
     m = NET_TOOL.search(text)
     if m and URL_OR_IP.search(text):
         hosts = url_hosts(text)
-        if hosts and all(host_allowed(h) for h in hosts) and not EXFIL_HINT.search(text):
+        if hosts and all(host_allowed(h) for h in hosts) and not sends_data(text):
             return None
         return m
     m = NC_RAW.search(text) or CODE_NET.search(text)
@@ -155,30 +192,62 @@ def net_hit(text):
     return None
 
 
-def secret_hit(text, mode):
+def prose_secret_hit(text, ctx=""):
+    """Secret reference in prose: only when an action verb is aimed at it, un-negated, in one sentence."""
+    full = ctx + text
+    off = len(ctx)
+    for pat in (SECRET_PATHS, SECRET_NAMES):
+        for sm in pat.finditer(text):
+            pos = sm.start() + off
+            pre = sentence_prefix(full, pos)
+            if EXISTS_CHECK.search(pre):
+                continue
+            for v in SECRET_ACTION.finditer(pre):
+                if pre[:v.start()].count("`") % 2:  # verb is inside a code span (a name, not an instruction)
+                    continue
+                span = pre[v.end():]
+                if len(span) > 80 or TEMPLATE_ENV.search(span):
+                    continue
+                if NEG_SECRET.search(pre[:v.start()]) or DESCRIPTIVE_MODAL.search(pre[:v.start()]):
+                    continue
+                return sm
+    return None
+
+
+def secret_hit(text, mode, ctx=""):
     if mode == "text":
-        if not SECRET_VERB.search(text):
-            return None
-        if SECRET_NEGATION.search(text) and not NET_TOOL.search(text):
-            return None
-    return SECRET_PATHS.search(text) or SECRET_NAMES.search(text)
+        return prose_secret_hit(text, ctx)
+    cleaned = ENV_LOAD.sub(" ", text)
+    return SECRET_PATHS.search(cleaned) or SECRET_NAMES.search(cleaned)
 
 
-def line_rules(text, file, lineno, mode, kind="instruction"):
+def negated(text, pos, ctx):
+    return bool(NEG_NET.search(sentence_prefix(ctx + text, pos + len(ctx))))
+
+
+def line_rules(text, file, lineno, mode, kind="instruction", ctx=""):
     """Apply per-line text rules. mode: 'cmd' (a command string) or 'text' (prose)."""
     out = []
     m = net_hit(text)
-    if m:
+    if m and not (mode == "text" and negated(text, m.start(), ctx)):
         combo = bool(EXFIL_HINT.search(text))
         out.append(mk("PF002", file, lineno,
                       "Sends data out to the network" if combo else "Makes a network call",
                       snippet(text, m.start())))
-    m = secret_hit(text, mode)
+    m = secret_hit(text, mode, ctx)
     if m:
         out.append(mk("PF003", file, lineno, "Reaches for secrets or credentials", snippet(text, m.start())))
     m = PIPE_EXEC.search(text) or DOWNLOAD_RUN.search(text)
-    if m:
-        out.append(mk("PF004", file, lineno, "Downloads and runs a script", snippet(text, m.start())))
+    if m and not (mode == "text" and negated(text, m.start(), ctx)):
+        hosts = url_hosts(text)
+        official = mode == "text" and hosts and all(
+            any(h == d or h.endswith("." + d) for d in OFFICIAL_INSTALLERS) for h in hosts)
+        if official:
+            out.append(mk("PF004", file, lineno, "Official installer piped/run from the web", snippet(text, m.start()),
+                          severity="medium",
+                          why="Runs a script straight from the web; this host is the tool's official installer, but pinning a checksum is safer."))
+        else:
+            out.append(mk("PF004", file, lineno, "Downloads and runs a script", snippet(text, m.start())))
     m = PERM_TEXT.search(text)
     if m:
         out.append(mk("PF102", file, lineno, "Bypasses agent permission checks", snippet(text, m.start())))
@@ -340,8 +409,12 @@ def clean_hidden(s):
 
 def scan_instruction(text, file):
     findings, decoded = hidden_unicode(text, file)
+    prev = ""
     for n, line in enumerate(text.split("\n"), 1):
-        findings.extend(line_rules(clean_hidden(line), file, n, "text"))
+        cl = clean_hidden(line)
+        ctx = "" if re.match(r"\s*([-*+|#>]|\d+[.)])\s", cl) or not prev.strip() else prev.strip() + " "
+        prev = cl
+        findings.extend(line_rules(cl, file, n, "text", ctx=ctx))
         for m in URL_RE.finditer(line):
             host = urlparse(m.group(0)).hostname or ""
             if not host_allowed(host):
@@ -365,7 +438,7 @@ def scan_text_config(text, file, extra=None):
     return findings
 
 
-def scan_json_config(text, file, base):
+def scan_json_config(text, file, base, root=None):
     findings, decoded = hidden_unicode(text, file)
     lines = text.split("\n")
     try:
@@ -387,7 +460,7 @@ def scan_json_config(text, file, base):
                 continue
             findings.append(f)
     if base.startswith("settings") and isinstance(data, dict):
-        findings.extend(claude_settings(data, file, lines))
+        findings.extend(claude_settings(data, file, lines, root))
     if base in ("mcp.json",) or isinstance(data, dict) and ("mcpServers" in data or "servers" in data):
         findings.extend(mcp_rules(data, file, lines))
     if base == "tasks.json":
@@ -403,7 +476,63 @@ def scan_json_config(text, file, base):
     return findings
 
 
-def claude_settings(data, file, lines):
+SCRIPT_PATTERNS = [
+    re.compile(r"\"?\$\{?CLAUDE_PROJECT_DIR\}?\"?/([^\s\"';|&)]+)"),
+    re.compile(r"(?<![\w./$-])(\./[^\s\"';|&)]+|\.claude/[^\s\"';|&)]+|scripts/[^\s\"';|&)]+)"),
+    re.compile(r"\b(?:node|bash|sh|zsh|python3?)\s+(?:-[\w-]+\s+)*([^\s\"';|&$~/-][^\s\"';|&]*)"),
+]
+
+
+def resolve_script(root, rel):
+    """Return (relpath, text) for a regular, non-symlink, in-repo file <= 1 MB, else None."""
+    if not root:
+        return None
+    rr = os.path.realpath(root)
+    p = os.path.normpath(os.path.join(rr, rel.strip("\"'")))
+    if not p.startswith(rr + os.sep):
+        return None
+    cur = rr
+    for part in os.path.relpath(p, rr).split(os.sep):
+        cur = os.path.join(cur, part)
+        if os.path.islink(cur):
+            return None
+    try:
+        if not os.path.isfile(p) or os.path.getsize(p) > MAX_SCRIPT_BYTES:
+            return None
+        text = read_text(p)
+    except OSError:
+        return None
+    if text is None:
+        return None
+    return os.path.relpath(p, rr).replace(os.sep, "/"), text
+
+
+def hook_scripts(root, cmd):
+    seen, out = set(), []
+    for pat in SCRIPT_PATTERNS:
+        for m in pat.finditer(cmd):
+            r = resolve_script(root, m.group(1))
+            if r and r[0] not in seen:
+                seen.add(r[0])
+                out.append(r)
+    return out
+
+
+def scan_script(rel, text, called_by):
+    findings, _ = hidden_unicode(text, rel)
+    for n, line in enumerate(text.split("\n"), 1):
+        st = line.strip()
+        if (st.startswith("#") and not st.startswith("#!")) or st.startswith("//"):
+            continue
+        for f in line_rules(clean_hidden(line), rel, n, "cmd"):
+            if f["rule"] in ("PF002", "PF003", "PF004"):
+                findings.append(f)
+    for f in findings:
+        f["detail"] = called_by
+    return findings
+
+
+def claude_settings(data, file, lines, root=None):
     out = []
     hooks = data.get("hooks")
     if isinstance(hooks, dict):
@@ -418,19 +547,51 @@ def claude_settings(data, file, lines):
                     cmd = h.get("command") if isinstance(h, dict) else None
                     if not isinstance(cmd, str):
                         continue
-                    title = "%s hook runs a command" % event
-                    if event in AUTO_EVENTS:
-                        title += " automatically"
+                    ln = find_line(lines, cmd)
                     flags = []
-                    if net_hit(cmd) or PIPE_EXEC.search(cmd):
+                    if net_hit(cmd):
                         flags.append("reaches the network")
                     if secret_hit(cmd, "cmd"):
                         flags.append("touches secrets")
+                    if PIPE_EXEC.search(cmd) or DOWNLOAD_RUN.search(cmd):
+                        flags.append("runs a downloaded script")
+                    details, any_hit = [], bool(flags)
+                    sflags = []
+                    for rel, stext in hook_scripts(root, cmd):
+                        sf = scan_script(rel, stext, "called by %s:%d %s hook" % (file, ln, event))
+                        out.extend(sf)
+                        hit = {f["rule"] for f in sf} & {"PF002", "PF003", "PF004"}
+                        for r_, w_ in (("PF002", "reaches the network"), ("PF003", "touches secrets"),
+                                       ("PF004", "runs a downloaded script")):
+                            if r_ in hit and w_ not in sflags:
+                                sflags.append(w_)
+                        d = "script: %s (%d lines)" % (rel, len(stext.splitlines()))
+                        if not hit:
+                            d += " \u2014 no network or secret access found in the script"
+                        details.append(d)
+                    start = event in START_EVENTS
+                    if start:
+                        title = "%s hook runs a command automatically when a session starts" % event
+                    else:
+                        title = "%s hook runs a command on every %s" % (event, event)
                     why = None
-                    if flags:
-                        title += " and " + " and ".join(flags)
-                        why = "This hook runs by itself and " + " and ".join(flags) + "; that is the pattern used to steal credentials."
-                    out.append(mk("PF001", file, find_line(lines, cmd), title, snippet(cmd), why=why))
+                    sev = "high" if start else "medium"
+                    if flags or sflags:
+                        sev = "high"
+                        parts = list(flags) + ["its script " + w for w in sflags if w not in flags]
+                        title = "%s hook runs a command%s and %s" % (
+                            event, " automatically" if start else "", " and ".join(parts))
+                        why = ("This hook runs by itself and %s; that is the pattern used to steal credentials."
+                               % " and ".join(parts))
+                    elif start:
+                        why = "This command runs on your machine automatically as soon as a session starts, before you type anything."
+                    else:
+                        why = "This command runs on your machine every time the %s event fires, without asking." % event
+                    f = mk("PF001", file, ln, title, snippet(cmd), severity=sev, why=why)
+                    f["event"] = event
+                    if details:
+                        f["detail"] = "; ".join(details)
+                    out.append(f)
     perms = data.get("permissions")
     if isinstance(perms, dict):
         allow = perms.get("allow")
@@ -580,7 +741,7 @@ def scan_repo(root):
             findings.extend(scan_text_config(text, rel))
         else:
             findings.extend(scan_json_config(text, rel, base.replace("settings.local.json", "settings.json")
-                                              if rel.startswith(".claude/") else base))
+                                              if rel.startswith(".claude/") else base, root))
     uniq, seen = [], set()
     for f in findings:
         key = (f["rule"], f["file"], f["line"], f["snippet"], f["title"])

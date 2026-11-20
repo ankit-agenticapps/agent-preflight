@@ -4,7 +4,7 @@ import os
 import sys
 
 from . import __version__
-from .scanner import SEV_ORDER, scan_repo
+from .scanner import SEV_ORDER, START_EVENTS, scan_repo
 
 COLORS = {"high": "\033[1;31m", "medium": "\033[1;33m", "low": "\033[2m"}
 LABEL = {"high": "HIGH", "medium": "MED ", "low": "LOW "}
@@ -42,6 +42,8 @@ def render(path, n, findings, color):
         loc = "%s:%d" % (f["file"], f["line"])
         out.append("%s  %s  %s  %s" % (paint(LABEL[f["severity"]], code), paint(f["rule"], BOLD), loc, f["title"]))
         out.append("      " + paint(f["snippet"], DIM if f["severity"] == "low" else ""))
+        if f.get("detail"):
+            out.append("      " + paint(f["detail"], DIM))
         out.append("      " + paint("why: " + f["why"], DIM))
         out.append("")
     text, level = verdict(counts(findings), n)
@@ -52,13 +54,19 @@ def render(path, n, findings, color):
 
 def table(rows, color):
     w = max([len("repo")] + [len(r["repo"]) for r in rows])
-    lines = ["", "%s  %5s  %4s  %3s  %3s" % ("repo".ljust(w), "files", "HIGH", "MED", "LOW")]
+    lines = ["", "%s  %5s  %4s  %3s  %3s  %5s" % ("repo".ljust(w), "files", "HIGH", "MED", "LOW", "hooks")]
     lines.append("-" * len(lines[1]))
     for r in rows:
         hi = "%4d" % r["high"]
         if color and r["high"]:
             hi = COLORS["high"] + hi + RESET
-        lines.append("%s  %5d  %s  %3d  %3d" % (r["repo"].ljust(w), r["files_scanned"], hi, r["medium"], r["low"]))
+        lines.append("%s  %5d  %s  %3d  %3d  %5d" % (r["repo"].ljust(w), r["files_scanned"], hi, r["medium"], r["low"], r["hooks"]))
+    n = len(rows)
+    with_hooks = sum(1 for r in rows if r["hooks"])
+    at_start = sum(1 for r in rows if r["hooks_start"])
+    lines.append("")
+    lines.append("%d of %d repo%s %s agent hooks that run commands on your machine (%d at session start)"
+                 % (with_hooks, n, "" if n == 1 else "s", "ships" if with_hooks == 1 else "ship", at_start))
     return "\n".join(lines)
 
 
@@ -100,10 +108,13 @@ def main(argv=None):
             worst = max(worst, 3)
             continue
         n, fs = scan_repo(t)
+        hook_fs = [f for f in fs if f["rule"] == "PF001"]
+        hooks = len(hook_fs)
+        hooks_start = sum(1 for f in hook_fs if f.get("event") in START_EVENTS)
         fs = [f for f in fs if SEV_ORDER[f["severity"]] >= floor]
         c = counts(fs)
         results.append({"path": os.path.abspath(t), "repo": os.path.basename(os.path.abspath(t)), "files_scanned": n,
-                        "findings": fs, **c})
+                        "findings": fs, "hooks": hooks, "hooks_start": hooks_start, **c})
         worst = max(worst, 2 if c["high"] else 1 if c["medium"] else 0)
 
     if args.json:
@@ -112,7 +123,7 @@ def main(argv=None):
         print(json.dumps({
             "findings": allf,
             "summary": dict(tot, repos=len(results), files_scanned=sum(r["files_scanned"] for r in results), exit_code=worst),
-            "repos": [{k: r[k] for k in ("path", "files_scanned", "high", "medium", "low")} for r in results],
+            "repos": [{k: r[k] for k in ("path", "files_scanned", "high", "medium", "low", "hooks", "hooks_start")} for r in results],
         }, indent=2, ensure_ascii=False))
         return worst
 
