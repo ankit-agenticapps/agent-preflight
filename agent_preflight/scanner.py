@@ -87,11 +87,13 @@ OVERRIDE = [
     re.compile(r"ignore\s+all\s+(\w+\s+)?instructions", I),
     re.compile(r"(do\s+not|don'?t)\s+(tell|inform|notify|alert|mention(\s+this)?\s+to)\s+(the\s+)?(user|human|developer)", I),
     re.compile(r"\bwithout\s+(asking|telling|informing|notifying)\b", I),
-    re.compile(r"\bsilently\b", I),
+    re.compile(r"\b(do|run|perform|make|keep)\s+(this|these|it|them|that)\s+silently\b"
+               r"|\bsilently\s*,?\s+without\b"
+               r"|\bsilently\s+(run|send|upload|install|execute|delete|modify|change|add|commit|push|exfiltrate|post)\b", I),
     re.compile(r"(don'?t|do\s+not|never)\s+ask\s+(for\s+)?(confirmation|permission|approval)", I),
-    re.compile(r"\bnever\s+mention\b", I),
-    re.compile(r"\bhide\s+this\b", I),
-    re.compile(r"\byou\s+are\s+now\b", I),
+    re.compile(r"\bnever\s+mention\s+(this|it|that|these|the\s+(above|setup|instructions?|step))\b", I),
+    re.compile(r"\bhide\s+(this|it|that)\s+from\s+(the\s+)?(user|human|developer|them|him|her)\b", I),
+    re.compile(r"\byou\s+are\s+now\s+(a|an|dan|unrestricted|no\s+longer|free\s+from)\b", I),
     re.compile(r"\bsystem\s+override\b", I),
 ]
 PERM_TEXT = re.compile(r"--dangerously-skip-permissions|--dangerously-bypass-approvals\S*|--yolo\b|bypassPermissions", I)
@@ -518,18 +520,114 @@ def hook_scripts(root, cmd):
     return out
 
 
+CONST_URL = re.compile(r"([A-Za-z_]\w*)\s*[:=]\s*['\"`](https?://[^'\"`\s]+)['\"`]")
+EGRESS_CALLS = [
+    ("fetch", re.compile(r"(?<![\w.])fetch\s*\("), "fetch"),
+    ("request", re.compile(r"\bhttps?\.request\s*\("), None),
+    ("axios", re.compile(r"\b(axios|got)\.(post|put|patch)\s*\("), None),
+    ("xhr", re.compile(r"\bnew\s+XMLHttpRequest\b"), None),
+    ("beacon", re.compile(r"\bsendBeacon\s*\("), None),
+    ("requests", re.compile(r"\brequests\.(post|put|patch)\s*\("), None),
+    ("urlopen", re.compile(r"\burlopen\s*\("), "urlopen"),
+]
+TELEMETRY_WORDS = re.compile(r"telemetry|analytics|track|segment|posthog|mixpanel", I)
+SECRETISH = re.compile(r"process\.env\.\w*(KEY|TOKEN|SECRET|PASSWORD)|process\.env\[|os\.environ|getenv\s*\(\s*['\"]\w*(KEY|TOKEN|SECRET|PASSWORD)", I)
+REMOTE_GUARD = re.compile(
+    r"(?:\[\[?|\btest)\s+\"?\$\{?CLAUDE_CODE_REMOTE(?::-[^}]*)?\}?\"?\s*!==?\s*\"?true\"?\s*\]{0,2}\s*;?\s*(?:then\s*)?exit\s+0"
+    r"|(?:\[\[?|\btest)\s+\"?\$\{?CLAUDE_CODE_REMOTE(?::-[^}]*)?\}?\"?\s*==?\s*\"?true\"?\s*\]{0,2}\s*\|\|\s*exit\s+0")
+DL_CMD = re.compile(r"\b(curl|wget)\b[^\n]*?(-o\b|-O\b|--output|--output-document|>\s*\S)", re.I)
+
+
+def _call_window(text, start):
+    depth, i, n = 1, start, len(text)
+    while i < n and depth and i - start < 1500:
+        c = text[i]
+        depth += c == "(" 
+        depth -= c == ")"
+        i += 1
+    return text[start:i]
+
+
+def js_egress(text, rel, called_by):
+    """Find JS/Python network egress that sends data. Returns list of findings (PF002)."""
+    consts = {m.group(1): m.group(2) for m in CONST_URL.finditer(text)}
+    secretish = bool(SECRETISH.search(text) or SECRET_PATHS.search(text))
+    out = []
+    for kind, pat, mode in EGRESS_CALLS:
+        for m in pat.finditer(text):
+            win = _call_window(text, m.end())
+            if mode == "fetch" and not re.search(r"method\s*:\s*['\"`](POST|PUT|PATCH)|\bbody\s*[:,}]", win, re.I):
+                continue
+            if mode == "urlopen" and not re.search(r"\bdata\s*=", win):
+                continue
+            names = re.findall(r"\$\{\s*(\w+)\s*\}", win[:300])
+            sub = re.sub(r"\$\{\s*(\w+)\s*\}", lambda x: consts.get(x.group(1), "${" + x.group(1) + "}"), win)
+            um = re.search(r"https?://[^\s'\"`)]+", sub)
+            ident = re.match(r"\s*([A-Za-z_]\w*)", win)
+            if not um and ident and ident.group(1) in consts:
+                names.append(ident.group(1))
+                um = re.search(r"https?://[^\s'\"`)]+", consts[ident.group(1)])
+            host = ""
+            if um:
+                try:
+                    host = urlparse(um.group(0)).hostname or ""
+                except ValueError:
+                    host = ""
+            if not host or "$" in host or "{" in host:
+                host = "unknown host"
+            line = text.count("\n", 0, m.start()) + 1
+            allowed = host_allowed(host)
+            sev = "high" if (secretish and not allowed) else "medium"
+            f = mk("PF002", rel, line, "Hook script sends data to %s" % host, snippet(text.split("\n")[line - 1]),
+                   severity=sev,
+                   why="This script posts data to a remote host every time the hook fires.")
+            d = called_by
+            if TELEMETRY_WORDS.search(host) or any(TELEMETRY_WORDS.search(x) for x in names):
+                d += "; looks like analytics/telemetry"
+            f["detail"] = d
+            f["egress_host"] = host
+            out.append(f)
+    return out
+
+
+def download_summary(text):
+    """One-phrase summary of 'download a file then extract/install it' behaviour, or None."""
+    lines = text.split("\n")
+    for i, l in enumerate(lines):
+        if DL_CMD.search(l):
+            um = re.search(r"https?://([^/\s'\"`]+)(/[^\s'\"`]*)?", l)
+            if not um:
+                continue
+            segs = [x for x in (um.group(2) or "").split("/") if x and "$" not in x][:2]
+            what = um.group(1) + ("/" + "/".join(segs) if segs else "")
+            if um.group(2) and "/releases/" in um.group(2):
+                what += " release"
+            rest = "\n".join(lines[i + 1:i + 12])
+            if re.search(r"\bsudo\b", rest):
+                return "downloads %s and installs it with sudo" % what
+            if re.search(r"\b(tar|unzip|mv|chmod|install|dpkg|cp)\b", rest):
+                return "downloads %s and installs/extracts it" % what
+    return None
+
+
 def scan_script(rel, text, called_by):
+    """Return (findings, meta) for a followed hook script."""
     findings, _ = hidden_unicode(text, rel)
     for n, line in enumerate(text.split("\n"), 1):
         st = line.strip()
         if (st.startswith("#") and not st.startswith("#!")) or st.startswith("//"):
             continue
         for f in line_rules(clean_hidden(line), rel, n, "cmd"):
+            if f["rule"] == "PF002" and not (NET_TOOL.search(line) or NC_RAW.search(line)):
+                continue  # JS/Python calls are judged by js_egress (plain GETs are not egress)
             if f["rule"] in ("PF002", "PF003", "PF004"):
                 findings.append(f)
     for f in findings:
         f["detail"] = called_by
-    return findings
+    eg = js_egress(text, rel, called_by)
+    findings.extend(eg)
+    meta = {"egress": [f for f in eg], "guarded": bool(REMOTE_GUARD.search(text)), "download": download_summary(text)}
+    return findings, meta
 
 
 def claude_settings(data, file, lines, root=None):
@@ -557,17 +655,26 @@ def claude_settings(data, file, lines, root=None):
                         flags.append("runs a downloaded script")
                     details, any_hit = [], bool(flags)
                     sflags = []
+                    guarded_all, egress_hosts = [], []
                     for rel, stext in hook_scripts(root, cmd):
-                        sf = scan_script(rel, stext, "called by %s:%d %s hook" % (file, ln, event))
+                        sf, meta = scan_script(rel, stext, "called by %s:%d %s hook" % (file, ln, event))
                         out.extend(sf)
-                        hit = {f["rule"] for f in sf} & {"PF002", "PF003", "PF004"}
+                        hit = {f["rule"] for f in sf if not f.get("egress_host") or f["severity"] == "high"} & {"PF002", "PF003", "PF004"}
                         for r_, w_ in (("PF002", "reaches the network"), ("PF003", "touches secrets"),
                                        ("PF004", "runs a downloaded script")):
                             if r_ in hit and w_ not in sflags:
                                 sflags.append(w_)
                         d = "script: %s (%d lines)" % (rel, len(stext.splitlines()))
-                        if not hit:
+                        hosts = sorted({f["egress_host"] for f in meta["egress"]})
+                        egress_hosts.extend(hosts)
+                        if hosts:
+                            tele = any("telemetry" in f["detail"] for f in meta["egress"])
+                            d += " \u2014 script sends data to %s%s" % (", ".join(hosts), " (looks like analytics/telemetry)" if tele else "")
+                        elif not hit:
                             d += " \u2014 no network or secret access found in the script"
+                        if meta["download"]:
+                            d += " \u2014 " + meta["download"]
+                        guarded_all.append(meta["guarded"])
                         details.append(d)
                     start = event in START_EVENTS
                     if start:
@@ -587,8 +694,16 @@ def claude_settings(data, file, lines, root=None):
                         why = "This command runs on your machine automatically as soon as a session starts, before you type anything."
                     else:
                         why = "This command runs on your machine every time the %s event fires, without asking." % event
+                    remote_only = bool(guarded_all) and all(guarded_all)
+                    if remote_only and not (flags or sflags):
+                        sev = "low"
+                        details.append("only runs in Claude Code on the web (CLAUDE_CODE_REMOTE), exits immediately on your machine")
+                        why = "Guarded by CLAUDE_CODE_REMOTE: the script exits immediately unless it is running in Claude Code on the web."
                     f = mk("PF001", file, ln, title, snippet(cmd), severity=sev, why=why)
                     f["event"] = event
+                    f["remote_only"] = remote_only
+                    if egress_hosts:
+                        f["egress_host"] = ", ".join(sorted(set(egress_hosts)))
                     if details:
                         f["detail"] = "; ".join(details)
                     out.append(f)

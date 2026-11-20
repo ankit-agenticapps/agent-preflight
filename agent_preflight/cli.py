@@ -64,9 +64,13 @@ def table(rows, color):
     n = len(rows)
     with_hooks = sum(1 for r in rows if r["hooks"])
     at_start = sum(1 for r in rows if r["hooks_start"])
+    web_only = sum(1 for r in rows if r["hooks_start"] and not r["hooks_start_local"])
+    egress = sum(1 for r in rows if r["hooks_egress"])
     lines.append("")
-    lines.append("%d of %d repo%s %s agent hooks that run commands on your machine (%d at session start)"
-                 % (with_hooks, n, "" if n == 1 else "s", "ships" if with_hooks == 1 else "ship", at_start))
+    lines.append("%d of %d repo%s %s agent hooks that run commands (%d at session start; %d of those only in Claude Code on the web). "
+                 "%d %s data to a third-party host."
+                 % (with_hooks, n, "" if n == 1 else "s", "ships" if with_hooks == 1 else "ship", at_start, web_only,
+                    egress, "sends" if egress == 1 else "send"))
     return "\n".join(lines)
 
 
@@ -111,10 +115,12 @@ def main(argv=None):
         hook_fs = [f for f in fs if f["rule"] == "PF001"]
         hooks = len(hook_fs)
         hooks_start = sum(1 for f in hook_fs if f.get("event") in START_EVENTS)
+        hooks_start_local = sum(1 for f in hook_fs if f.get("event") in START_EVENTS and not f.get("remote_only"))
+        hooks_egress = sum(1 for f in hook_fs if f.get("egress_host"))
         fs = [f for f in fs if SEV_ORDER[f["severity"]] >= floor]
         c = counts(fs)
         results.append({"path": os.path.abspath(t), "repo": os.path.basename(os.path.abspath(t)), "files_scanned": n,
-                        "findings": fs, "hooks": hooks, "hooks_start": hooks_start, **c})
+                        "findings": fs, "hooks": hooks, "hooks_start": hooks_start, "hooks_start_local": hooks_start_local, "hooks_egress": hooks_egress, **c})
         worst = max(worst, 2 if c["high"] else 1 if c["medium"] else 0)
 
     if args.json:
@@ -123,7 +129,7 @@ def main(argv=None):
         print(json.dumps({
             "findings": allf,
             "summary": dict(tot, repos=len(results), files_scanned=sum(r["files_scanned"] for r in results), exit_code=worst),
-            "repos": [{k: r[k] for k in ("path", "files_scanned", "high", "medium", "low", "hooks", "hooks_start")} for r in results],
+            "repos": [{k: r[k] for k in ("path", "files_scanned", "high", "medium", "low", "hooks", "hooks_start", "hooks_start_local", "hooks_egress")} for r in results],
         }, indent=2, ensure_ascii=False))
         return worst
 
