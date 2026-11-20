@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-preflight"
+version = "0.1.0"
+description = "Scan a repo's AI coding agent instruction and config files for traps before an agent opens it."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Ankit Agarwal" }]
+keywords = ["security", "ai-agents", "claude-code", "prompt-injection"]
+
+[project.scripts]
+agent-preflight = "agent_preflight.cli:main"
+
+[tool.setuptools]
+packages = ["agent_preflight"]
